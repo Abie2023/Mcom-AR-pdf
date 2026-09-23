@@ -13,7 +13,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📄 Fund Report -> Morningstar Template")
+st.title("AR Report Portfolio holdings")
 st.write("Upload a PDF fund report, specify the target fund details in the sidebar, and extract structured financial data into the Morningstar template.")
 
 # Let the user input their own API key
@@ -60,6 +60,61 @@ TEMPLATE_COLUMNS = [
     'Cost (Base)', 'Country', 'Fund TNA', 'Unnamed: 15', '% TNA', 
     'Unnamed: 17', 'AssetType Reference'
 ]
+
+class AIExtractionError(Exception):
+    """Raised when the configured AI provider cannot return valid extraction data."""
+
+
+def extract_json_with_ai(api_key, document_parts, extraction_prompt, model="gemini-3.8-flash"):
+    """Send document parts to the configured OpenAI-compatible AI provider."""
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": document_parts + [
+                        {"type": "text", "text": extraction_prompt}
+                    ],
+                }
+            ],
+            response_format={"type": "json_object"},
+        )
+    except OpenAIError as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 429:
+            raise AIExtractionError(
+                "Gemini rate limit reached. Please wait and try again."
+            ) from exc
+        if status_code == 503:
+            raise AIExtractionError(
+                "Gemini is temporarily unavailable. Please try again shortly."
+            ) from exc
+        if status_code in {400, 401, 403, 404}:
+            raise AIExtractionError(
+                f"Gemini request failed ({status_code}). Check the API key, model, and request."
+            ) from exc
+        raise AIExtractionError(f"Gemini API request failed: {exc}") from exc
+
+    if not response.choices:
+        raise AIExtractionError("Gemini returned no response choices.")
+
+    response_text = response.choices[0].message.content
+    if not response_text:
+        raise AIExtractionError("Gemini returned an empty response.")
+
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise AIExtractionError("Gemini returned invalid JSON.") from exc
+    if not isinstance(data, dict):
+        raise AIExtractionError("Gemini returned JSON, but it was not a JSON object.")
+    return data
+
 
 # --- 3. Main File Upload & Processing Pipeline ---
 uploaded_file = st.file_uploader("Upload Fund Report (PDF)", type=["pdf"])
@@ -140,36 +195,11 @@ Return ONLY raw JSON without markdown code fences. Remove currency symbols and f
                 except pymupdf.FileDataError as exc:
                     raise ValueError("The uploaded file is not a readable PDF.") from exc
 
-                client = OpenAI(
-                    api_key=API_KEY,
-                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+                data = extract_json_with_ai(
+                    API_KEY,
+                    document_parts,
+                    extraction_prompt,
                 )
-                response = client.chat.completions.create(
-                    model="gemini-3.8-flash",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": document_parts + [
-                                {"type": "text", "text": extraction_prompt}
-                            ],
-                        }
-                    ],
-                    response_format={"type": "json_object"},
-                )
-
-                if not response.choices:
-                    raise ValueError("Gemini returned no response choices.")
-
-                response_text = response.choices[0].message.content
-                if not response_text:
-                    raise ValueError("Gemini returned an empty response.")
-
-                try:
-                    data = json.loads(response_text)
-                except json.JSONDecodeError as exc:
-                    raise ValueError("Gemini returned invalid JSON.") from exc
-                if not isinstance(data, dict):
-                    raise ValueError("Gemini returned JSON, but it was not a JSON object.")
 
                 fund_tna = data.get('total_net_assets', 0)
                 extracted_currency = data.get('base_currency', '')
@@ -267,7 +297,7 @@ Return ONLY raw JSON without markdown code fences. Remove currency symbols and f
                     type="primary"
                 )
                 
-            except OpenAIError as e:
+            except AIExtractionError as e:
                 st.error(f"❌ Gemini API Error: {e}")
             except ValueError as e:
                 st.error(f"❌ PDF/JSON Error: {e}")
