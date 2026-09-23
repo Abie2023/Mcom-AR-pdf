@@ -10,7 +10,7 @@ This script is a single-file financial document processing pipeline designed for
 
 - A user uploads a PDF fund report.
 - The user enters the target fund name, optional fund ID, and portfolio date in the sidebar.
-- The app sends the PDF and a highly structured extraction prompt to Gemini.
+- The app extracts PDF text and tables locally, selects relevant sections, and sends one compact request with the highly structured extraction prompt to Gemini.
 - Gemini returns raw JSON describing:
   - financial position line items,
   - portfolio investments/holdings,
@@ -36,20 +36,21 @@ This application is built as a single Streamlit page without a formal backend or
 
 1. Collect user inputs and validation checks.
 2. Accept uploaded PDF from the browser.
-3. Render the PDF pages to PNG images in memory.
-4. Send the page images and extraction prompt to Gemini.
-5. Parse the JSON response.
-6. Normalize rows for balance sheet items and holdings.
-7. Construct a DataFrame aligned to the Morningstar schema.
-8. Render a preview table in Streamlit.
-9. Download the Excel workbook as an in-memory file.
+3. Extract page text and tables locally with PyMuPDF.
+4. Detect text-based versus scanned PDFs and select relevant financial pages.
+5. Send only compact local content and, when needed, selected scanned pages to Gemini.
+6. Validate the single JSON response.
+7. Normalize rows for balance sheet items and holdings.
+8. Construct a DataFrame aligned to the Morningstar schema.
+9. Render a preview table in Streamlit.
+10. Download the Excel workbook as an in-memory file.
 
 ### Notable design characteristics
 
 - Uses Streamlit for interface and interaction.
 - Uses pandas for table shaping and export.
 - Uses the OpenAI Python SDK with Google's Gemini OpenAI-compatible API for PDF ingestion and structured extraction.
-- Sends the uploaded PDF inline as base64-encoded file content.
+- Extracts text and tables locally and renders only selected image-only pages for vision fallback.
 - Produces an in-memory Excel workbook without writing to disk.
 
 ---
@@ -66,6 +67,7 @@ import pandas as pd
 import io
 import json
 import base64
+import pymupdf
 from openai import OpenAI, OpenAIError
 ```
 
@@ -75,8 +77,8 @@ Purpose of each import:
 - `pandas`: DataFrame creation, date normalization, transformation, and Excel export.
 - `io`: in-memory binary buffer for Excel download generation.
 - `json`: parsing the Gemini response JSON.
-- `base64`: encode rendered PDF pages for inline image input.
-- `pymupdf`: render PDF pages to PNG images.
+- `base64`: encode selected rendered PDF pages for inline image input.
+- `pymupdf`: extract PDF text/tables and render selected pages to PNG images.
 - `from openai import OpenAI, OpenAIError`: OpenAI-compatible Gemini client and API error type.
 
 ### 3.2 Page configuration and UI shell
@@ -208,33 +210,20 @@ except Exception:
 
 This ensures the portfolio date is standardized to `M/D/YYYY` without leading zeros. If parsing fails, it falls back to the original text string.
 
-### 3.9 Gemini client setup and PDF input
+### 3.9 Local PDF parsing and Gemini input
 
 ```python
-client = OpenAI(
-    api_key=API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+pages = extract_pdf_content(uploaded_file.getvalue())
+scanned_pdf = detect_scanned_pdf(pages)
+relevant_page_indexes = detect_relevant_pages(pages)
+document_parts, vision_page_count = build_gemini_document_parts(
+    uploaded_file.getvalue(), pages, relevant_page_indexes, scanned_pdf
 )
 ```
 
-This constructs the OpenAI client using the user-provided Gemini key and Google's compatibility endpoint.
+Text and table content are extracted locally. Only relevant pages without usable text are rendered to images for Gemini vision input. The request is bounded to one extraction call, with limited retry for transient failures or malformed JSON.
 
-```python
-pdf_document = pymupdf.open(stream=uploaded_file.getvalue(), filetype="pdf")
-document_parts = []
-for page in pdf_document:
-    page_image = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
-    image_data = base64.b64encode(page_image.tobytes("png")).decode("utf-8")
-    document_parts.append({
-        "type": "image_url",
-        "image_url": {"url": f"data:image/png;base64,{image_data}"},
-    })
-pdf_document.close()
-```
-
-The PDF pages are rendered in memory because the OpenAI-compatible endpoint accepts image URLs rather than PDF file parts.
-
-### 3.10 Extraction prompt construction
+### 3.10 Extraction prompt and JSON validation
 
 The script builds a long prompt instructing the model to extract structured financial and investment data from the PDF.
 
@@ -259,35 +248,11 @@ Key points in the prompt:
 
 The actual prompt is sent as:
 
-```python
-response = client.chat.completions.create(
-    model="gemini-3.8-flash",
-    messages=[{
-        "role": "user",
-        "content": [
-            {"type": "file", "file": {
-                "filename": uploaded_file.name or "fund_report.pdf",
-                "file_data": f"data:application/pdf;base64,{pdf_data}",
-            }},
-            {"type": "text", "text": extraction_prompt},
-        ],
-    }],
-    response_format={"type": "json_object"},
-)
-```
+The existing extraction prompt is sent with the compact local document parts through the OpenAI-compatible Gemini endpoint using the stable `gemini-3.8-flash` model. The response is validated for the expected `financial_position`, `investments`, `total_net_assets`, and `base_currency` fields before mapping.
 
-This uses the stable `gemini-3.8-flash` model with JSON response mode enabled so the model returns parseable JSON instead of freeform text.
+### 3.11 Parsing and output generation
 
-### 3.11 Parsing
-
-```python
-response_text = response.choices[0].message.content
-data = json.loads(response_text)
-fund_tna = data.get('total_net_assets', 0)
-extracted_currency = data.get('base_currency', '')
-```
-
-The returned response text is parsed into a Python dictionary. API failures, empty responses, and invalid JSON are shown as focused Streamlit errors.
+`validate_extraction_json()` verifies the response is an object containing the four expected top-level fields and list-shaped financial position and investment entries. `build_morningstar_output()` then applies the existing mapping, date, coupon, and 19-column Excel logic.
 
 ### 3.12 Mapping financial position rows
 
@@ -405,13 +370,7 @@ st.dataframe(df_final, use_container_width=True)
 
 The app displays a success message and a preview table to the user.
 
-```python
-excel_buffer = io.BytesIO()
-with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-    df_final.to_excel(writer, index=False, sheet_name='Sheet1')
-```
-
-The workbook is created entirely in memory using `BytesIO`, which lets the script avoid writing local Excel files.
+The workbook is created entirely in memory by `build_morningstar_output()`, which lets the script avoid writing local Excel files.
 
 ```python
 safe_date = formatted_portfolio_date.replace('/', '')
@@ -423,7 +382,7 @@ This builds the download file name. The date is flattened to remove the forward 
 ```python
 st.download_button(
     label="📥 Download Morningstar Excel Output",
-    data=excel_buffer.getvalue(),
+    data=excel_data,
     file_name=filename,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     type="primary"
@@ -469,11 +428,11 @@ The entire generation process is wrapped in a `try/except` block to catch failur
 ### Extraction phase
 
 9. The script normalizes the date to `M/D/YYYY`.
-10. It creates a Gemini client with the supplied API key.
-11. It writes the uploaded PDF to a temporary file.
-12. It uploads the PDF to Gemini.
-13. It crafts a prompt that instructs the model to extract only the requested fund and date.
-14. Gemini returns JSON with the structured financial and investment data.
+10. It extracts text and tables locally and detects relevant pages.
+11. It renders only relevant image-only pages when vision is needed.
+12. It sends one compact request to Gemini with bounded transient-error retries.
+13. It validates the JSON response against the expected extraction shape.
+14. Gemini returns structured financial and investment data for mapping.
 
 ### Transformation phase
 
@@ -497,13 +456,15 @@ The entire generation process is wrapped in a `try/except` block to catch failur
 
 ## 5. Functions, Classes, and Routes
 
-This script does not define reusable Python functions, custom classes, or HTTP routes.
+The script defines reusable helpers for:
 
-### What is present instead
-
-- Top-level script execution flow
-- Streamlit UI elements and event blocks
-- Inline logic blocks inside the main upload-handling branch
+- local PDF text extraction and table extraction,
+- scanned-PDF detection,
+- relevant-page and section selection,
+- selective vision payload construction,
+- Gemini request/retry handling,
+- JSON validation,
+- Morningstar mapping and Excel generation.
 - Built-in Streamlit methods such as:
   - `st.set_page_config`
   - `st.title`
@@ -518,9 +479,7 @@ This script does not define reusable Python functions, custom classes, or HTTP r
   - `st.error`
   - `st.warning`
 
-### Interpretation
-
-This is a procedural script, not an object-oriented application. The core logic is executed directly in the main execution path rather than via method calls on a class instance or route handlers.
+The Streamlit UI remains a direct script, while the expensive and provider-specific operations are isolated behind these functions.
 
 ---
 
@@ -541,6 +500,7 @@ streamlit
 pandas
 openpyxl
 openai
+PyMuPDF
 ```
 
 ### Environment assumptions
@@ -582,7 +542,7 @@ pip install -r requirements.txt
 ### Option B: Direct install without a virtual environment
 
 ```bash
-pip install streamlit pandas openpyxl openai
+pip install streamlit pandas openpyxl openai PyMuPDF
 ```
 
 ---
