@@ -8,7 +8,7 @@ A Streamlit-based PDF extraction app that reads a fund report, uses Google Gemin
 
 This script is a single-file financial document processing pipeline designed for a very specific task:
 
-- A user uploads a PDF fund report.
+- A user enters a Morningstar Document ID; the app fetches the PDF in memory.
 - The user enters the target fund name, optional fund ID, and portfolio date in the sidebar.
 - The app extracts PDF text and tables locally, selects relevant sections, and sends one compact request with the highly structured extraction prompt to Gemini.
 - Gemini returns raw JSON describing:
@@ -35,7 +35,7 @@ The script is intentionally opinionated and highly specialized:
 This application is built as a single Streamlit page without a formal backend or API server. It follows a straightforward data flow:
 
 1. Collect user inputs and validation checks.
-2. Accept uploaded PDF from the browser.
+2. Fetch the Morningstar PDF from its Document ID.
 3. Extract page text and tables locally with PyMuPDF.
 4. Detect text-based versus scanned PDFs and select relevant financial pages.
 5. Send only compact local content and, when needed, selected scanned pages to Gemini.
@@ -95,7 +95,7 @@ This configures the Streamlit browser page title, icon, and wide layout.
 
 ```python
 st.title("📄 Fund Report -> Morningstar Template")
-st.write("Upload a PDF fund report, specify the target fund details in the sidebar, and extract structured financial data into the Morningstar template.")
+st.write("Enter a Morningstar Document ID, specify the target fund details in the sidebar, and extract structured financial data into the Morningstar template.")
 ```
 
 These calls set the main heading and a top-level descriptive message.
@@ -103,15 +103,13 @@ These calls set the main heading and a top-level descriptive message.
 ### 3.3 Authentication section
 
 ```python
-st.sidebar.header("🔑 Authentication")
-API_KEY = st.sidebar.text_input(
-    "Gemini API Key",
-    type="password",
-    help="Get your free key from Google AI Studio (starts with AQ.). This key is not saved."
-)
+st.sidebar.header("🔑 Gemini authentication")
+gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password")
+st.sidebar.button("Refresh Gemini Models")
+selected_model = st.sidebar.selectbox("Gemini extraction model", available_gemini_models)
 ```
 
-This creates a password input in the sidebar for a Gemini API key. The key is only kept in the app session and is not persisted.
+This creates a provider selector and password input for the selected provider. Provider keys are only used in the app session and are not displayed in diagnostics.
 
 Important note: the script checks for `API_KEY` in the app UI, but the error message mentions `.streamlit/secrets.toml` as a legacy or alternate pattern. The actual implementation uses the text input instead of storing secrets locally.
 
@@ -170,18 +168,19 @@ TEMPLATE_COLUMNS = [
 
 This list defines the exact output schema expected by the Morningstar-style workbook. The script later ensures the final DataFrame matches these columns and uses the same ordering.
 
-### 3.6 File upload entry point
+### 3.6 Morningstar document entry point
 
 ```python
-uploaded_file = st.file_uploader("Upload Fund Report (PDF)", type=["pdf"])
+document_id = st.text_input("Morningstar Document ID", placeholder="e.g. 670134091")
+document_url, pdf_bytes = fetch_morningstar_pdf(document_id)
 ```
 
-This creates the upload widget. The code only accepts PDF files.
+The app validates that the ID contains only digits, constructs the configurable Morningstar URL, and keeps the downloaded PDF bytes in memory.
 
 ### 3.7 Main processing gate
 
 ```python
-if uploaded_file is not None:
+if st.button("Process Report", type="primary"):
     if not API_KEY:
         st.error("⚠️ API Key not found! Please add `GEMINI_API_KEY` to your `.streamlit/secrets.toml` file.")
     elif not inputs_valid:
@@ -191,9 +190,10 @@ if uploaded_file is not None:
 
 This is the main validation-and-trigger sequence:
 
-1. If no API key is entered, the app stops and shows an error.
-2. If the required fund metadata is missing, it warns the user.
-3. If both are valid, it renders a generation button.
+6. The user enters a numeric Morningstar Document ID.
+7. The app displays the generated URL and fetches the PDF only after `Process Report` is clicked.
+8. The app verifies that the API key exists and all required fund metadata is filled in.
+9. The downloaded bytes are passed directly to PyMuPDF without writing a PDF to disk.
 4. Once the button is pressed, the script executes the extraction pipeline.
 
 ### 3.8 Date normalization for portfolio date
@@ -206,18 +206,14 @@ try:
     formatted_portfolio_date = f"{dt_port.month}/{dt_port.day}/{dt_port.year}"
 except Exception:
     formatted_portfolio_date = portfolio_date
-```
-
+5. Enter the Morningstar Document ID, for example `670134091`.
+6. Click `Process Report`.
 This ensures the portfolio date is standardized to `M/D/YYYY` without leading zeros. If parsing fails, it falls back to the original text string.
 
 ### 3.9 Local PDF parsing and Gemini input
 
 ```python
-pages = extract_pdf_content(uploaded_file.getvalue())
-scanned_pdf = detect_scanned_pdf(pages)
-relevant_page_indexes = detect_relevant_pages(pages)
-document_parts, vision_page_count = build_gemini_document_parts(
-    uploaded_file.getvalue(), pages, relevant_page_indexes, scanned_pdf
+    pdf_bytes, pages, relevant_page_indexes
 )
 ```
 
@@ -229,20 +225,10 @@ The script builds a long prompt instructing the model to extract structured fina
 
 Key points in the prompt:
 
-- It states that the model must operate only on the exact target fund and date.
-- It instructs the model to ignore other funds and dates.
-- It defines the expected JSON structure:
-  - `financial_position`
   - `investments`
   - `total_net_assets`
   - `base_currency`
-- It explicitly defines the rules for `holding_id` standardization:
-  - `*E*` for common stock and related securities
-  - `*B*` for bonds
-  - `CASH` for cash-related instruments
-  - `*QQ*` for other assets and liabilities/commodities/property
   - `DERIVATIVES` for derivative instruments
-  - `FUND` for mutual funds and ETFs
 - It requires liability values to be stored as negative numbers.
 - It requires `maturity_date` to be formatted as `M/D/YYYY` without leading zeros.
 
@@ -470,7 +456,7 @@ The script defines reusable helpers for:
   - `st.title`
   - `st.write`
   - `st.sidebar.text_input`
-  - `st.file_uploader`
+    - `st.selectbox`
   - `st.button`
   - `st.spinner`
   - `st.success`
@@ -539,10 +525,21 @@ Then install the dependencies:
 pip install -r requirements.txt
 ```
 
+Configure the Gemini API key:
+
+```text
+Copy .env.example to .env
+Add your Gemini API key
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+The app checks `st.secrets["GEMINI_API_KEY"]` first and falls back to `GEMINI_API_KEY` from `.env`.
+
 ### Option B: Direct install without a virtual environment
 
 ```bash
-pip install streamlit pandas openpyxl openai PyMuPDF
+pip install streamlit pandas openpyxl openai PyMuPDF python-dotenv
 ```
 
 ---
@@ -560,11 +557,11 @@ On Windows PowerShell, this is the usual command in the activated environment.
 ### In the browser
 
 1. Open the local Streamlit URL shown in the terminal.
-2. Paste your Gemini API key in the sidebar.
+2. Select a provider and enter its API key/token in the sidebar.
 3. Enter the target fund name and portfolio date.
 4. Enter an optional fund ID.
-5. Upload the PDF report.
-6. Click the generation button.
+5. Enter the Morningstar Document ID.
+6. Click `Process Report`.
 7. Review the parsed output preview.
 8. Download the Morningstar Excel workbook.
 

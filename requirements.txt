@@ -3,3 +3,5 @@ pandas
 openpyxl
 openai
 PyMuPDF
+requests
+python-dotenv
