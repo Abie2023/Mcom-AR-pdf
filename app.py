@@ -71,6 +71,13 @@ portfolio_date = st.sidebar.text_input(
     help="Target reporting date formatted as M/D/YYYY (no leading zeros)."
 )
 
+manual_page_selection = st.sidebar.text_input(
+    "Relevant PDF Pages",
+    value="",
+    placeholder="e.g. 120-135, 142-148",
+    help="Optional. Enter individual pages or inclusive ranges. Leave blank for automatic detection.",
+)
+
 # Mandatory field check helper
 inputs_valid = bool(fund_name.strip() and portfolio_date.strip())
 
@@ -83,19 +90,34 @@ TEMPLATE_COLUMNS = [
     'Unnamed: 17', 'AssetType Reference'
 ]
 
-RELEVANT_SECTION_KEYWORDS = (
-    "statement of assets and liabilities",
-    "statement of investments",
-    "schedule of investments",
-    "portfolio of investments",
-    "net assets",
-    "total investments",
-    "cash and cash equivalents",
-    "derivatives",
-    "securities portfolio",
-    "statement of net assets",
-    "portfolio breakdown",
-    "top ten holdings",
+INVESTMENT_SUPPORT_PATTERNS = (
+    "market value",
+    "Valuation",
+    "evaluation",
+    "Nominal",
+    "% of net assets",
+    "% of total net assets",
+    "security",
+    "fixed interest",
+    "equities",
+    "bonds",
+    "collective investment scheme",
+    "holdings",
+    "quantity",
+    "fair value",
+    "cash and bank balances",
+)
+INVESTMENT_HEADER_PATTERNS = (
+    ("portfolio statement", r"^\s*portfolio statement(?:\s*\(continued\))?\s+as at\b"),
+    ("portfolio of investments", r"^\s*portfolio of investments\s*$"),
+    ("statement of investments", r"^\s*statement of investments\b"),
+    ("schedule of investments", r"^\s*schedule of investments\b"),
+)
+FINANCIAL_POSITION_HEADER_PATTERNS = (
+    ("balance sheet", r"^\s*balance sheet\s*$"),
+    ("statement of financial position", r"^\s*statement of financial position\b"),
+    ("statement of net assets", r"^\s*statement of net assets\b"),
+    ("statement of assets and liabilities", r"^\s*statement of assets and liabilities\b"),
 )
 MAX_RELEVANT_PAGES = 24
 MAX_LOCAL_CONTEXT_CHARS = 120_000
@@ -303,46 +325,117 @@ def detect_scanned_pdf(pages):
     return text_page_count / len(pages) < 0.5
 
 
+def parse_manual_page_selection(page_selection, page_count):
+    """Parse 1-based page numbers/ranges into sorted zero-based page indexes."""
+    if not page_selection.strip():
+        return None, ""
+
+    selected_pages = set()
+    for value in page_selection.split(","):
+        token = value.strip()
+        if not token:
+            raise ValueError("Invalid page syntax: empty page value.")
+        if re.fullmatch(r"\d+", token):
+            start_page = end_page = int(token)
+        else:
+            range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+            if not range_match:
+                raise ValueError(
+                    f"Invalid page syntax: '{token}'. Use pages like 120 or ranges like 120-135."
+                )
+            start_page, end_page = map(int, range_match.groups())
+            if start_page > end_page:
+                raise ValueError(
+                    f"Invalid page range: '{token}'. The first page must not exceed the last page."
+                )
+
+        if start_page < 1:
+            raise ValueError("Invalid PDF page: page numbers must start at 1.")
+        if end_page > page_count:
+            raise ValueError(
+                f"Invalid PDF page: page {end_page} exceeds the PDF page count ({page_count})."
+            )
+        selected_pages.update(range(start_page - 1, end_page))
+
+    if not selected_pages:
+        raise ValueError("No PDF pages were selected.")
+
+    sorted_pages = sorted(selected_pages)
+    display_ranges = []
+    range_start = range_end = sorted_pages[0] + 1
+    for page_index in sorted_pages[1:]:
+        page_number = page_index + 1
+        if page_number == range_end + 1:
+            range_end = page_number
+            continue
+        display_ranges.append(
+            str(range_start) if range_start == range_end else f"{range_start}-{range_end}"
+        )
+        range_start = range_end = page_number
+    display_ranges.append(
+        str(range_start) if range_start == range_end else f"{range_start}-{range_end}"
+    )
+    return sorted_pages, ", ".join(display_ranges)
+
+
+def page_relevance_matches(page):
+    """Return the specific investment and financial-position signals on a page."""
+    page_text = page["text"].lower()
+    is_contents_or_notes = (
+        "contents" in page_text[:500]
+        or "notes to the financial statements" in page_text[:180]
+    )
+    anchor_matches = [
+        label for label, pattern in INVESTMENT_HEADER_PATTERNS
+        if re.search(pattern, page["text"], flags=re.IGNORECASE | re.MULTILINE)
+    ] if not is_contents_or_notes else []
+    support_matches = [
+        pattern for pattern in INVESTMENT_SUPPORT_PATTERNS
+        if pattern in page_text
+    ]
+    has_table_column_combination = (
+        "market value" in page_text
+        and any(pattern in page_text for pattern in (
+            "quantity", "nominal market", "investment holding", "% of total net assets"
+        ))
+    )
+    investment_matches = anchor_matches.copy()
+    if has_table_column_combination and not is_contents_or_notes and anchor_matches:
+        investment_matches.extend(
+            pattern for pattern in support_matches
+            if pattern not in investment_matches
+        )
+    return {
+        "investment": investment_matches,
+        "investment_support": support_matches,
+        "financial_position": [
+            label for label, pattern in FINANCIAL_POSITION_HEADER_PATTERNS
+            if re.search(pattern, page["text"], flags=re.IGNORECASE | re.MULTILINE)
+        ] if not is_contents_or_notes else [],
+    }
+
+
 def detect_relevant_pages(pages, target_fund_name="", reporting_date=""):
-    """Find keyword-matching pages and include adjacent continuation pages."""
-    page_scores = []
-    exact_fund_name = " ".join(target_fund_name.lower().split())
-    exact_fund_pattern = re.compile(
-        rf"(?<!\w){re.escape(exact_fund_name)}(?!\s+side\s*-\s*pocket)(?!\w)"
-    ) if exact_fund_name else None
-    fund_terms = [term for term in exact_fund_name.split() if len(term) > 2]
-    date_terms = [term.lower() for term in reporting_date.replace("/", " ").split()]
-    target_section_matches = set()
-    for page in pages:
-        page_text = page["text"].lower()
-        score = sum(page_text.count(keyword) for keyword in RELEVANT_SECTION_KEYWORDS)
-        if exact_fund_pattern:
-            exact_matches = len(exact_fund_pattern.findall(page_text))
-            score += 100 * exact_matches
-            if exact_matches and any(
-                keyword in page_text for keyword in RELEVANT_SECTION_KEYWORDS
-            ) and "table of contents" not in page_text and "notes to the financial statements" not in page_text:
-                target_section_matches.add(page["number"] - 1)
-        score += 5 * sum(page_text.count(term) for term in fund_terms)
-        score += 2 * sum(page_text.count(term) for term in date_terms)
-        if score:
-            page_scores.append((score, page["number"] - 1))
+    """Find investment and balance-sheet pages, then include their neighbors."""
+    investment_pages = set()
+    financial_position_pages = set()
+    for page_index, page in enumerate(pages):
+        matches = page_relevance_matches(page)
+        if matches["investment"]:
+            investment_pages.add(page_index)
+        if matches["financial_position"]:
+            financial_position_pages.add(page_index)
 
-    if target_section_matches:
-        matches = target_section_matches
-    elif page_scores:
-        page_scores.sort(reverse=True)
-        matches = {page_index for _, page_index in page_scores[:MAX_RELEVANT_PAGES]}
-    else:
-        matches = {page["number"] - 1 for page in pages[:min(3, len(pages))]}
+    relevant = investment_pages | financial_position_pages
+    anchor_pages = relevant.copy()
+    for page_index in anchor_pages:
+        if page_index > 0:
+            relevant.add(page_index - 1)
+        if page_index + 1 < len(pages):
+            relevant.add(page_index + 1)
 
-    relevant = set(matches)
-    if not target_section_matches:
-        for page_index in list(matches):
-            if page_index > 0:
-                relevant.add(page_index - 1)
-            if page_index + 1 < len(pages):
-                relevant.add(page_index + 1)
+    if not relevant:
+        relevant = set(range(min(3, len(pages))))
     return sorted(relevant)[:MAX_RELEVANT_PAGES]
 
 
@@ -459,6 +552,17 @@ def _is_context_limit_error(error):
     ))
 
 
+def normalize_holding_quantity(quantity):
+    """Keep reported quantities and represent unavailable quantities as blank."""
+    if quantity is None or pd.isna(quantity):
+        return pd.NA
+    if isinstance(quantity, str) and quantity.strip().lower() in {
+        "", "n/a", "na", "-", "not reported", "not provided", "null", "none",
+    }:
+        return pd.NA
+    return quantity
+
+
 def generate_gemini_extraction(api_key, model, document_parts, extraction_prompt, status_callback=None):
     """Send one Gemini extraction request with bounded, status-aware retries."""
     if not api_key:
@@ -568,10 +672,21 @@ def build_morningstar_output(data, formatted_portfolio_date, fund_id, fund_name)
     """Apply the existing extraction mapping and build the Morningstar workbook."""
     fund_tna = data.get('total_net_assets', 0)
     extracted_currency = data.get('base_currency', '')
+    financial_position = data.get('financial_position', [])
+    investments = data.get('investments', [])
+
+    if not financial_position and not investments:
+        raise ValueError(
+            "Gemini JSON contains empty data arrays: "
+            f"financial_position={len(financial_position)}, "
+            f"investments={len(investments)}. "
+            "Local PDF context was sent successfully; check the fund name/date "
+            "against the report text."
+        )
 
     mapped_rows = []
 
-    for item in data.get('financial_position', []):
+    for item in financial_position:
         holding_name = item.get('item', '')
         holding_name_lower = holding_name.lower()
 
@@ -590,7 +705,7 @@ def build_morningstar_output(data, formatted_portfolio_date, fund_id, fund_name)
             'Market Value': item.get('value')
         })
 
-    for inv in data.get('investments', []):
+    for inv in investments:
         maturity_val = inv.get('maturity_date')
         try:
             if maturity_val and pd.notna(maturity_val):
@@ -613,13 +728,16 @@ def build_morningstar_output(data, formatted_portfolio_date, fund_id, fund_name)
         mapped_rows.append({
             'Holding Id': raw_id,
             'Holding Name': inv.get('name'),
-            'Number of Share': inv.get('quantity'),
+            'Number of Share': normalize_holding_quantity(inv.get('quantity')),
             'Market Value': inv.get('market_value'),
             'Coupon Rate': formatted_coupon,
             'Maturity Date': formatted_maturity
         })
 
-    df = pd.DataFrame(mapped_rows)
+    df = pd.DataFrame(mapped_rows, columns=[
+        'Holding Id', 'Holding Name', 'Number of Share', 'Market Value',
+        'Coupon Rate', 'Maturity Date',
+    ])
     df['Portfolio Date'] = formatted_portfolio_date
     df['Fund Id'] = fund_id
     df['Fund Name'] = fund_name
@@ -711,6 +829,7 @@ Extract the following into a valid JSON object:
      - "coupon_rate" (numeric/string or null, extract clean number if it is a bond)
      - "maturity_date" (string formatted M/D/YYYY without leading zeros, or null)
    - For Corporate Bonds: Include Credit Rating in the holding name if available.
+    - If Share/Quantity is missing, blank, "N/A", "-", or not reported, keep the holding in the response, set "quantity" to null, and extract "market_value" whenever it is reported. Never calculate quantity from market value.
 
 3. 'total_net_assets': Single numeric value for Net Asset Value / Total Net Assets for "{fund_name}" on "{formatted_portfolio_date}".
 
@@ -721,11 +840,18 @@ Return ONLY raw JSON without markdown code fences. Remove currency symbols and f
 
                 pages = extract_pdf_content(pdf_bytes)
                 scanned_pdf = detect_scanned_pdf(pages)
-                relevant_page_indexes = detect_relevant_pages(
-                    pages,
-                    target_fund_name=fund_name,
-                    reporting_date=formatted_portfolio_date,
-                )
+                if manual_page_selection.strip():
+                    relevant_page_indexes, manual_page_display = parse_manual_page_selection(
+                        manual_page_selection,
+                        len(pages),
+                    )
+                    st.info(f"Using manually selected pages: {manual_page_display}")
+                else:
+                    relevant_page_indexes = detect_relevant_pages(
+                        pages,
+                        target_fund_name=fund_name,
+                        reporting_date=formatted_portfolio_date,
+                    )
                 document_parts, vision_page_count = build_gemini_document_parts(
                     pdf_bytes,
                     pages,
@@ -742,8 +868,31 @@ Return ONLY raw JSON without markdown code fences. Remove currency symbols and f
                 )
                 st.caption(
                     f"PDF pages: {len(pages)} | Locally parsed pages: {local_text_page_count} | "
-                    f"Relevant pages: {len(relevant_page_indexes)} | Vision pages: {vision_page_count}"
+                    f"Selected pages: {len(relevant_page_indexes)} | "
+                    f"Vision pages: {vision_page_count} | "
+                    f"Gemini context characters: {_document_parts_characters(document_parts):,}"
                 )
+                selected_page_numbers = [pages[index]["number"] for index in relevant_page_indexes]
+                st.caption(f"Selected PDF pages: {selected_page_numbers}")
+                with st.expander("Local extraction diagnostic"):
+                    for page_index in relevant_page_indexes:
+                        page = pages[page_index]
+                        page_preview = " ".join(page["text"].split())[:300]
+                        relevance_matches = page_relevance_matches(page)
+                        matched_patterns = (
+                            relevance_matches["investment"]
+                            + relevance_matches["financial_position"]
+                        )
+                        st.text(
+                            f"Page {page['number']} | text={len(page['text'])} chars | "
+                            f"tables={len(page['tables'])} | "
+                            f"matched patterns={matched_patterns or ['neighbor']} | "
+                            f"preview: {page_preview}"
+                        )
+                    st.caption(
+                        "Gemini text context characters: "
+                        f"{_document_parts_characters(document_parts):,}"
+                    )
                 request_status = st.empty()
                 provider_result = generate_gemini_extraction(
                     API_KEY,
@@ -761,6 +910,14 @@ Return ONLY raw JSON without markdown code fences. Remove currency symbols and f
                     f"Input characters: {provider_result['input_characters']:,} | "
                     f"Estimated input tokens: ~{provider_result['estimated_tokens']:,} | "
                     f"Response time: {response_time:.2f}s"
+                )
+                st.caption(
+                    "Gemini JSON structure: "
+                    f"keys={sorted(data.keys())}; "
+                    f"financial_position={len(data.get('financial_position', []))}; "
+                    f"investments={len(data.get('investments', []))}; "
+                    f"total_net_assets_present={'total_net_assets' in data}; "
+                    f"base_currency_present={'base_currency' in data}"
                 )
 
                 df_final, excel_data = build_morningstar_output(
